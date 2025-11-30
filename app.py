@@ -84,18 +84,61 @@ def ask_ai(data: UserMessage):
 
 @app.post("/nlu/parse", response_model=NluResponse)
 def nlu_parse(req: NluRequest):
-    """
-    NLU genérico (sin lógica de clasificación). Solo devuelve texto plano.
-    """
+    prompt = f"""
+Eres un clasificador de intenciones para un asistente financiero personal.
+Tu objetivo es interpretar el mensaje del usuario y devolver SOLO un JSON válido.
+
+Posibles intenciones:
+- greeting
+- register_transaction
+- ask_balance
+- ask_budget_status
+- ask_goal_status
+- modify_persona
+- smalltalk
+- unknown
+
+Extrae estos SLOTS cuando existan:
+- amount (monto en CLP, como número puro)
+- category (hogar, alimentación, transporte, salud, etc.)
+- date (convertir “ayer”, “hoy”, “lunes pasado” a YYYY-MM-DD, usando tz: {req.tz})
+- payment_method (efectivo, débito, crédito)
+- goalId (si aplica)
+- persona_property (tono, intensidad, etc.)
+
+INSTRUCCIONES:
+- Responde SOLO un JSON.
+- No agregues comentarios ni texto fuera del JSON.
+- Si no estás seguro de algo, deja el campo en null.
+
+Mensaje del usuario: "{req.text}"
+"""
+
     try:
+        completion = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Eres un asistente experto en NLU financiero."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+        )
+
+        raw = completion.choices[0].message.content.strip()
+
+        # Validar JSON
+        parsed = json.loads(raw)
+
         return NluResponse(
-            intent="unknown",
-            slots={},
-            confidence=0.0,
+            intent=parsed.get("intent", "unknown"),
+            slots=parsed.get("slots", {}),
+            confidence=float(parsed.get("confidence", 1.0)),
             raw_text=req.text
         )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"NLU error: {str(e)}")
+
 
 
 @app.post("/style/reply", response_model=ReplyResponse)
