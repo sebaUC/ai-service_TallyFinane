@@ -1,165 +1,168 @@
-# app.py
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from openai import OpenAI
-import os
-from dotenv import load_dotenv
-from typing import Optional, Dict, List
+from __future__ import annotations
 
-# ==============================
-# ⚙️ CONFIGURACIÓN
-# ==============================
-load_dotenv()
-app = FastAPI(title="AI Service", version="1.0")
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from typing import Union
+import uuid
 
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
+from openai import APITimeoutError, OpenAI
 
-# ==============================
-# 📦 MODELOS DE DATOS
-# ==============================
-class UserMessage(BaseModel):
-    userMessage: str
+from config import settings
+from orchestrator import Orchestrator
+from schemas import (
+    ERROR_INVALID_PHASE,
+    ERROR_LLM_ERROR,
+    ERROR_LLM_TIMEOUT,
+    ERROR_MISSING_ACTION_RESULT,
+    ERROR_MISSING_USER_TEXT,
+    OrchestrateRequestPhaseA,
+    OrchestrateRequestPhaseB,
+    OrchestrateResponsePhaseA,
+    OrchestrateResponsePhaseB,
+)
+from debug_logger import debug_log
 
+# =============================================================================
+# App Setup
+# =============================================================================
 
-class NluRequest(BaseModel):
-    text: str
-    locale: Optional[str] = "es-CL"
-    tz: Optional[str] = "America/Santiago"
-    hints: Optional[Dict] = None
-    taxonomy: Optional[List[str]] = None
-
-
-class NluResponse(BaseModel):
-    intent: str
-    slots: Dict = Field(default_factory=dict)
-    confidence: float = 1.0
-    raw_text: Optional[str] = None
+app = FastAPI(title="AI Service - TallyFinance", version=settings.SERVICE_VERSION)
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
+orchestrator = Orchestrator(client=client, config=settings)
+log = debug_log.app
 
 
-class Persona(BaseModel):
-    tone: Optional[str] = "neutral"
-    intensity: Optional[int] = 1
-    formality: Optional[str] = "neutral"
-    verbosity: Optional[str] = "balanced"
-    emojis: Optional[str] = "few"
-    locale: Optional[str] = "es-CL"
+# =============================================================================
+# Endpoints
+# =============================================================================
 
 
-class ReplyContext(BaseModel):
-    action: str
-    summary: str
-
-
-class ReplyRequest(BaseModel):
-    persona: Persona
-    context: ReplyContext
-
-
-class ReplyResponse(BaseModel):
-    reply: str
-
-
-# ==============================
-# 💬 ENDPOINTS
-# ==============================
-
-@app.post("/ask", response_model=Dict)
-def ask_ai(data: UserMessage):
+@app.post(
+    "/orchestrate",
+    response_model=Union[OrchestrateResponsePhaseA, OrchestrateResponsePhaseB],
+)
+def orchestrate(
+    req: Union[OrchestrateRequestPhaseA, OrchestrateRequestPhaseB],
+    x_correlation_id: str = Header(default=None),
+):
     """
-    Enruta cualquier mensaje del usuario directamente a GPT.
+    Main orchestration endpoint.
+
+    Phase A: Analyze user text and return tool_call, clarification, or direct_reply.
+    Phase B: Generate personalized message from action result.
     """
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "user", "content": data.userMessage}
-            ],
-            timeout=20,
-        )
-        reply = completion.choices[0].message.content
-        return {"reply": reply}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
-
-
-@app.post("/nlu/parse", response_model=NluResponse)
-def nlu_parse(req: NluRequest):
-    prompt = f"""
-Eres un clasificador de intenciones para un asistente financiero personal.
-Tu objetivo es interpretar el mensaje del usuario y devolver SOLO un JSON válido.
-
-Posibles intenciones:
-- greeting
-- register_transaction
-- ask_balance
-- ask_budget_status
-- ask_goal_status
-- modify_persona
-- smalltalk
-- unknown
-
-Extrae estos SLOTS cuando existan:
-- amount (monto en CLP, como número puro)
-- category (hogar, alimentación, transporte, salud, etc.)
-- date (convertir “ayer”, “hoy”, “lunes pasado” a YYYY-MM-DD, usando tz: {req.tz})
-- payment_method (efectivo, débito, crédito)
-- goalId (si aplica)
-- persona_property (tono, intensidad, etc.)
-
-INSTRUCCIONES:
-- Responde SOLO un JSON.
-- No agregues comentarios ni texto fuera del JSON.
-- Si no estás seguro de algo, deja el campo en null.
-
-Mensaje del usuario: "{req.text}"
-"""
+    # Use correlation ID from header or generate one
+    cid = x_correlation_id or str(uuid.uuid4())[:8]
 
     try:
-        completion = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "Eres un asistente experto en NLU financiero."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
+        log.separator(cid)
+        log.recv(f"Phase {req.phase}", {"user": req.user_context.user_id}, cid)
+
+        if req.phase == "A":
+            # Validate Phase A requirements
+            if not isinstance(req, OrchestrateRequestPhaseA):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"detail": "Invalid request for Phase A", "code": ERROR_INVALID_PHASE},
+                )
+            if not req.user_text or not req.user_text.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail={"detail": "Phase A requires user_text", "code": ERROR_MISSING_USER_TEXT},
+                )
+
+            response = orchestrator.phase_a(
+                user_text=req.user_text,
+                user_context=req.user_context,
+                tools=req.tools,
+                pending=req.pending,
+                available_categories=req.available_categories,
+                cid=cid,
+            )
+
+            log.send("Phase A response", {"type": response.response_type}, cid)
+            return response
+
+        elif req.phase == "B":
+            # Validate Phase B requirements
+            if not isinstance(req, OrchestrateRequestPhaseB):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"detail": "Invalid request for Phase B", "code": ERROR_INVALID_PHASE},
+                )
+            if req.action_result is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"detail": "Phase B requires action_result", "code": ERROR_MISSING_ACTION_RESULT},
+                )
+
+            response = orchestrator.phase_b(
+                tool_name=req.tool_name,
+                action_result=req.action_result,
+                user_context=req.user_context,
+                runtime_context=req.runtime_context,
+                cid=cid,
+            )
+
+            log.send("Phase B response", {"length": len(response.final_message)}, cid)
+            return response
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail={"detail": "Phase must be 'A' or 'B'", "code": ERROR_INVALID_PHASE},
+            )
+
+    except HTTPException:
+        raise
+    except APITimeoutError as e:
+        log.err("LLM timeout", {"error": str(e)[:50]}, cid)
+        raise HTTPException(
+            status_code=503,
+            detail={"detail": f"LLM timeout: {e}", "code": ERROR_LLM_TIMEOUT},
+        )
+    except Exception as e:  # noqa: BLE001
+        log.err("LLM error", {"error": str(e)[:80]}, cid)
+        raise HTTPException(
+            status_code=500,
+            detail={"detail": f"LLM error: {e}", "code": ERROR_LLM_ERROR},
         )
 
-        raw = completion.choices[0].message.content.strip()
 
-        # Validar JSON
-        parsed = json.loads(raw)
-
-        return NluResponse(
-            intent=parsed.get("intent", "unknown"),
-            slots=parsed.get("slots", {}),
-            confidence=float(parsed.get("confidence", 1.0)),
-            raw_text=req.text
-        )
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"NLU error: {str(e)}")
-
-
-
-@app.post("/style/reply", response_model=ReplyResponse)
-def style_reply(req: ReplyRequest):
-    """
-    Genera una respuesta textual simple, sin estilo específico.
-    """
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "user", "content": req.context.summary}
-            ],
-            timeout=20,
-        )
-        reply = completion.choices[0].message.content
-        return ReplyResponse(reply=reply)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Reply error: {str(e)}")
+@app.get("/health")
+def health():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "model": settings.OPENAI_MODEL,
+        "version": settings.SERVICE_VERSION,
+    }
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "ai-service", "mode": "generic"}
+    """Root endpoint with service info."""
+    return {
+        "status": "ok",
+        "service": "ai-service",
+        "version": settings.SERVICE_VERSION,
+    }
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Log request validation errors with the incoming body to diagnose 422 issues.
+    """
+    try:
+        raw_body = (await request.body()).decode("utf-8", errors="ignore")
+    except Exception:  # noqa: BLE001
+        raw_body = "<unavailable>"
+
+    log.err("Validation error 422", {"errors": str(exc.errors())[:100], "body": raw_body[:100]})
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+    )
